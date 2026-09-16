@@ -38,6 +38,24 @@ impl VerificationVote {
     pub fn is_valid(&self) -> bool {
         matches!(self, VerificationVote::Valid)
     }
+
+    /// Check if an invalid vote was caused by a transient operational error
+    /// (e.g. verifying key unavailable, privacy pool offline, IO failure)
+    /// rather than a substantive verification failure of the proof itself.
+    pub fn is_transient_error(&self) -> bool {
+        match self {
+            VerificationVote::Invalid { reason } => {
+                let r = reason.to_lowercase();
+                r.contains("unavailable")
+                    || r.contains("not available")
+                    || r.contains("verification error")
+                    || r.contains("error:")
+                    || r.contains("failed to read")
+                    || r.contains("io error")
+            }
+            _ => false,
+        }
+    }
 }
 
 /// One validator's recorded vote, keyed in the tally by its co-sign wallet.
@@ -124,6 +142,22 @@ impl VoteTally {
                 // `reason` differs.
                 return Ok(None);
             }
+
+            // A transient operational failure (e.g. verifying key unavailable or
+            // privacy pool temporarily offline) followed by a successful Valid
+            // verification upon recovery must not be punished as Byzantine equivocation.
+            if previous.vote.is_transient_error() && vote.is_valid() {
+                votes.insert(
+                    wallet,
+                    VoteRecord {
+                        vote,
+                        node_id,
+                        signature,
+                    },
+                );
+                return Ok(None);
+            }
+
             let evidence = SlashingEvidence::Equivocation {
                 request_id: self.request_id.clone(),
                 wallet_pubkey: wallet.clone(),

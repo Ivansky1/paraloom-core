@@ -1572,4 +1572,91 @@ mod tests {
             assert_eq!(info.stake_amount, 1_000_000_000);
         }
     }
+
+    #[tokio::test]
+    async fn transient_invalid_then_valid_does_not_ban_honest_wallet() {
+        let dir = std::env::temp_dir().join(format!("poc-eq-fix-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let rep_path = dir.join("reputation.json");
+        let (c, rx) = TransactVerificationCoordinator::new_with_approvals();
+        let mut c = c
+            .with_local_node_id(NodeId(vec![0]))
+            .with_local_wallet("W0".to_string())
+            .with_reputation_persistence(rep_path.clone());
+        c.set_consensus_thresholds(2, 2);
+        c.register_validator_with_wallet(NodeId(vec![0]), Some("W0".to_string())).await;
+        c.register_validator_with_wallet(NodeId(vec![1]), Some("W1".to_string())).await;
+        c.sync_onchain_stakes(
+            std::collections::HashMap::from([
+                ("W0".to_string(), 1_000_000_000u64),
+                ("W1".to_string(), 1_000_000_000u64),
+            ]),
+            2_000_000_000,
+        ).await;
+        let mut approvals = rx;
+
+        let mut req = TransactVerificationRequest {
+            request_id: String::new(),
+            recipient: [1u8; 32],
+            mint: None,
+            nullifiers: [[2u8; 32], [3u8; 32]],
+            output_commitments: [[4u8; 32], [5u8; 32]],
+            root: [6u8; 32],
+            ext_amount: -100,
+            proof: vec![7, 8, 9],
+            ciphertexts: ["a".to_string(), "b".to_string()],
+            timestamp: 123,
+        };
+        req.request_id = req.canonical_id();
+        let id = req.request_id.clone();
+        c.start_verification(req).await.unwrap();
+
+        // Honest W1: transient verify failure -> Invalid with error reason.
+        c.submit_result(TransactVerificationResult {
+            request_id: id.clone(),
+            validator: NodeId(vec![1]),
+            vote: crate::consensus::vote_tally::VerificationVote::Invalid {
+                reason: "transact verifying key unavailable: ...".to_string(),
+            },
+            timestamp: 1,
+            wallet_pubkey: "W1".to_string(),
+            signature: vec![1],
+        }).await.unwrap();
+
+        // Key restored; the SAME canonical request re-broadcasts; W1 recovers with Valid.
+        c.submit_result(TransactVerificationResult {
+            request_id: id.clone(),
+            validator: NodeId(vec![1]),
+            vote: crate::consensus::vote_tally::VerificationVote::Valid,
+            timestamp: 2,
+            wallet_pubkey: "W1".to_string(),
+            signature: vec![2],
+        }).await.unwrap();
+
+        // W0 votes Valid.
+        c.submit_result(TransactVerificationResult {
+            request_id: id.clone(),
+            validator: NodeId(vec![0]),
+            vote: crate::consensus::vote_tally::VerificationVote::Valid,
+            timestamp: 3,
+            wallet_pubkey: "W0".to_string(),
+            signature: vec![3],
+        }).await.unwrap();
+
+        // Both wallets voted Valid, and W1 was NOT banned: 2-of-2 quorum forms!
+        assert!(
+            approvals.try_recv().is_ok(),
+            "the transient Invalid->Valid recovery must not ban the honest wallet; 2-of-2 quorum must form"
+        );
+
+        // Verify the wallet is NOT persisted as an equivocator.
+        let eq_path = rep_path.with_file_name("equivocators.json");
+        let on_disk = std::fs::read_to_string(&eq_path).unwrap_or_default();
+        assert!(
+            !on_disk.contains("\"W1\""),
+            "honest wallet must not be persisted to equivocators.json"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
